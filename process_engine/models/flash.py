@@ -1,98 +1,83 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict
 
-import numpy as np
-
-
-def cubic_roots(coefficients: List[float]) -> List[float]:
-    # Solve a cubic using NumPy's polynomial root utility.
-    coefficients = np.asarray(coefficients, dtype=float)
-    roots = np.roots(coefficients)
-    real_roots = []
-    for root in roots:
-        if abs(root.imag) < 1e-8:
-            real_roots.append(float(root.real))
-    return sorted(real_roots)
+from process_engine.component_db import ComponentDatabase
+from process_engine.models.stream import FlashResult, Stream
 
 
-class PengRobinsonEOS:
-    """A compact Peng-Robinson implementation for pure components and idealized mixtures."""
+def wilson_k_value(component_name: str, temperature: float, pressure: float, component_db: ComponentDatabase) -> float:
+    component = component_db.get(component_name)
+    if component.critical_temperature is None or component.critical_pressure is None:
+        raise ValueError(f"Component '{component_name}' is missing critical properties.")
 
-    R = 8.31446261815324
+    import numpy as np
 
-    @staticmethod
-    def alpha_factor(temperature: float, critical_temperature: float, acentric_factor: float) -> float:
-        kappa = 0.37464 + 1.54226 * acentric_factor - 0.26992 * acentric_factor**2
-        return (1.0 + kappa * (1.0 - np.sqrt(temperature / critical_temperature))) ** 2
+    critical_temperature = component.critical_temperature
+    critical_pressure = component.critical_pressure
+    acentric_factor = component.acentric_factor
+    ln_k = np.log(critical_pressure / pressure) + 5.373 * (1.0 + acentric_factor) * (1.0 - critical_temperature / temperature)
+    return float(np.exp(ln_k))
 
-    @staticmethod
-    def pure_compressibility_factor(
-        temperature: float,
-        pressure: float,
-        critical_temperature: float,
-        critical_pressure: float,
-        acentric_factor: float,
-    ) -> float:
-        if temperature <= 0 or pressure <= 0:
-            raise ValueError("Temperature and pressure must be positive.")
-        if critical_temperature <= 0 or critical_pressure <= 0:
-            raise ValueError("Critical properties must be positive.")
 
-        a = 0.45724 * PengRobinsonEOS.R**2 * critical_temperature**2 / critical_pressure
-        b = 0.07780 * PengRobinsonEOS.R * critical_temperature / critical_pressure
-        alpha = PengRobinsonEOS.alpha_factor(temperature, critical_temperature, acentric_factor)
-        a *= alpha
+def rachford_rice(z: Dict[str, float], k_values: Dict[str, float]) -> float:
+    if not z:
+        raise ValueError("Composition vector is empty.")
 
-        A = a * pressure / (PengRobinsonEOS.R**2 * temperature**2)
-        B = b * pressure / (PengRobinsonEOS.R * temperature)
+    ks = [k_values[name] for name in z]
+    if all(k <= 1.0 for k in ks):
+        return 0.0
+    if all(k >= 1.0 for k in ks):
+        return 1.0
 
-        coefficients = [1.0, -(1.0 + B), A - 3.0 * B**2 - 2.0 * B, -(A * B - B**2 - B**3)]
-        roots = cubic_roots(coefficients)
-        positive_roots = [value for value in roots if value > 0]
-        if not positive_roots:
-            raise ValueError("No positive compressibility root was found.")
+    lower = 0.0
+    upper = 1.0
+    for _ in range(200):
+        mid = 0.5 * (lower + upper)
+        value = sum(z[name] * (k_values[name] - 1.0) / (1.0 + mid * (k_values[name] - 1.0)) for name in z)
+        if value > 0:
+            lower = mid
+        else:
+            upper = mid
+    return 0.5 * (lower + upper)
 
-        # Pick the physically relevant root (largest positive root for vapor phase, smallest for liquid phase).
-        return max(positive_roots)
 
-    @staticmethod
-    def mixture_compressibility_factor(
-        temperature: float,
-        pressure: float,
-        critical_temperature: dict,
-        critical_pressure: dict,
-        acentric_factor: dict,
-        composition: dict,
-    ) -> float:
-        if not composition:
-            raise ValueError("Composition cannot be empty.")
+def tp_flash(stream: Stream, component_db: ComponentDatabase) -> FlashResult:
+    if stream.temperature <= 0 or stream.pressure <= 0:
+        raise ValueError(f"Stream '{stream.name}' has invalid temperature or pressure.")
 
-        total_moles = sum(composition.values())
-        if total_moles <= 0:
-            raise ValueError("Total composition must be positive.")
+    z = stream.composition
+    k_values = {name: wilson_k_value(name, stream.temperature, stream.pressure, component_db) for name in z}
+    beta = rachford_rice(z, k_values)
 
-        a_mix = 0.0
-        b_mix = 0.0
-        for name, xi in composition.items():
-            if xi <= 0:
-                continue
-            tc = critical_temperature[name]
-            pc = critical_pressure[name]
-            w = acentric_factor.get(name, 0.0)
-            a_i = 0.45724 * PengRobinsonEOS.R**2 * tc**2 / pc
-            b_i = 0.07780 * PengRobinsonEOS.R * tc / pc
-            alpha_i = PengRobinsonEOS.alpha_factor(temperature, tc, w)
-            a_i *= alpha_i
-            a_mix += xi * np.sqrt(a_i) * xi * np.sqrt(a_i)
-            b_mix += xi * b_i
+    vapor_composition = {}
+    liquid_composition = {}
+    for name, zi in z.items():
+        denominator = 1.0 + beta * (k_values[name] - 1.0)
+        if denominator <= 0:
+            raise ValueError(f"Non-physical denominator encountered in TP flash for component {name}.")
+        xi = zi / denominator
+        yi = k_values[name] * xi
+        liquid_composition[name] = xi
+        vapor_composition[name] = yi
 
-        A = a_mix * pressure / (PengRobinsonEOS.R**2 * temperature**2)
-        B = b_mix * pressure / (PengRobinsonEOS.R * temperature)
+    liq_total = sum(liquid_composition.values())
+    vap_total = sum(vapor_composition.values())
+    liquid_composition = {name: val / liq_total for name, val in liquid_composition.items()}
+    vapor_composition = {name: val / vap_total for name, val in vapor_composition.items()}
 
-        coefficients = [1.0, -(1.0 + B), A - 3.0 * B**2 - 2.0 * B, -(A * B - B**2 - B**3)]
-        roots = cubic_roots(coefficients)
-        positive_roots = [value for value in roots if value > 0]
-        if not positive_roots:
-            raise ValueError("No positive mixture compressibility root was found.")
-        return max(positive_roots)
+    if beta <= 1e-6:
+        phase = "liquid"
+    elif beta >= 1.0 - 1e-6:
+        phase = "vapor"
+    else:
+        phase = "two_phase"
+
+    return FlashResult(
+        vapor_fraction=beta,
+        liquid_fraction=1.0 - beta,
+        vapor_composition=vapor_composition,
+        liquid_composition=liquid_composition,
+        phase=phase,
+        k_values=k_values,
+    )
